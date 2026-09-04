@@ -164,8 +164,8 @@ func (s *Server) handleGetCandles(w http.ResponseWriter, r *http.Request) {
 		delta := (rand.Float64() - 0.49) * 4.0
 		open := currPrice
 		closePrice := currPrice + delta
-		high := mathMax(open, closePrice) + rand.Float64()*2.0
-		low := mathMin(open, closePrice) - rand.Float64()*2.0
+		high := mathMax(open, closePrice) + rand.Float64()*2.5 + 0.5
+		low := mathMin(open, closePrice) - rand.Float64()*2.5 - 0.5
 		candles = append(candles, map[string]any{
 			"time":  t,
 			"open":  open,
@@ -806,37 +806,43 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
             padding: 5px 14px;
             font-size: 12px;
             align-items: center;
-        }
-
-        /* Mobile Viewport Breakpoint Switcher (< 768px) */
+                /* Mobile Viewport Breakpoint Switcher (< 768px) */
         .mobile-tab-bar {
             display: none;
             background: var(--surface);
             border-bottom: 1px solid var(--border);
             overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
             white-space: nowrap;
-            padding: 4px 8px;
-            gap: 4px;
+            padding: 6px 10px;
+            gap: 6px;
             flex-shrink: 0;
+            scrollbar-width: none;
+        }
+        .mobile-tab-bar::-webkit-scrollbar {
+            display: none;
         }
         .mobile-tab-btn {
+            flex-shrink: 0;
+            white-space: nowrap;
             padding: 8px 14px;
             min-height: var(--touch-target);
             border-radius: 6px;
-            border: none;
-            background: transparent;
+            border: 1px solid transparent;
+            background: var(--surface-card);
             color: var(--text-dim);
-            font-size: 12px;
+            font-size: 13px;
             font-weight: 700;
             cursor: pointer;
             display: inline-flex;
             align-items: center;
             justify-content: center;
+            transition: 0.15s ease;
         }
         .mobile-tab-btn.active {
-            background: var(--surface-card);
+            background: var(--border);
             color: var(--amber);
-            border: 1px solid var(--border);
+            border-color: var(--amber);
         }
 
         /* RESPONSIVE BREAKPOINTS */
@@ -860,7 +866,7 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
                 height: auto;
                 overflow: visible;
             }
-            .chart-container { height: 220px; }
+            .chart-container { height: 260px; }
             .panel {
                 border-right: none;
                 border-bottom: 1px solid var(--border);
@@ -891,11 +897,11 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
 
     <!-- Mobile Tab Switcher (Appears below 768px) -->
     <div class="mobile-tab-bar">
-        <button class="mobile-tab-btn active" onclick="switchMobileTab('trade')">⚡ Trade Panel</button>
+        <button class="mobile-tab-btn active" onclick="switchMobileTab('trade')">⚡ Trade</button>
         <button class="mobile-tab-btn" onclick="switchMobileTab('chart')">📈 Chart</button>
-        <button class="mobile-tab-btn" onclick="switchMobileTab('orderbook')">📖 Order Book</button>
-        <button class="mobile-tab-btn" onclick="switchMobileTab('orders')">📋 Orders & History</button>
-        <button class="mobile-tab-btn" onclick="switchMobileTab('portfolio')">💰 Portfolio & Tape</button>
+        <button class="mobile-tab-btn" onclick="switchMobileTab('orderbook')">📖 Book</button>
+        <button class="mobile-tab-btn" onclick="switchMobileTab('orders')">📋 Orders</button>
+        <button class="mobile-tab-btn" onclick="switchMobileTab('portfolio')">💼 Portfolio</button>
     </div>
 
     <!-- Main Workspace -->
@@ -1027,9 +1033,21 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
         // Initialize TradingView Candlestick Chart
         function initChart() {
             const chartContainer = document.getElementById('tv-chart');
-            if (!chartContainer || typeof LightweightCharts === 'undefined') return;
+            if (!chartContainer) return;
+
+            if (typeof LightweightCharts === 'undefined') {
+                setTimeout(initChart, 250);
+                return;
+            }
+
+            if (chart) return; // Prevent duplicate initialization
+
+            const width = chartContainer.clientWidth || window.innerWidth || 375;
+            const height = chartContainer.clientHeight || 260;
 
             chart = LightweightCharts.createChart(chartContainer, {
+                width: width,
+                height: height,
                 layout: {
                     background: { color: '#121721' },
                     textColor: '#7d8590',
@@ -1039,7 +1057,8 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
                     horzLines: { color: '#181f2c' },
                 },
                 crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-                timeScale: { timeVisible: true, secondsVisible: false },
+                timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#232d3f' },
+                rightPriceScale: { borderColor: '#232d3f' }
             });
 
             candleSeries = chart.addCandlestickSeries({
@@ -1054,17 +1073,18 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
             fetch('/api/v1/candles')
                 .then(r => r.json())
                 .then(data => {
-                    if (data && data.length) {
+                    if (data && data.length && candleSeries) {
                         candleSeries.setData(data);
+                        chart.timeScale().fitContent();
                     }
                 })
                 .catch(err => console.error("Candle fetch error:", err));
 
             // Auto-resize chart on window change
             const resizeObserver = new ResizeObserver(entries => {
-                if (entries.length && chart) {
+                if (entries.length && chart && chartContainer.clientWidth > 0) {
                     const { width, height } = entries[0].contentRect;
-                    chart.applyOptions({ width, height });
+                    chart.applyOptions({ width: width || 375, height: height || 260 });
                 }
             });
             resizeObserver.observe(chartContainer);
@@ -1125,7 +1145,7 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
                     '<div class="ob-bar bid" style="width:' + width + '%;"></div>' +
                     '<span style="color:var(--green); font-weight:700;">▲ ' + b.price.toFixed(2) + '</span>' +
                     '<span style="text-align:center;">' + b.volume.toFixed(2) + '</span>' +
-                    '<span style="text-align:right;">' + (b.price * b.volume).toFixed(0) + '</span>' +
+                    '<span style="text-align:right;">' + (a.price * a.volume).toFixed(0) + '</span>' +
                 '</div>';
             }).join('');
             document.getElementById("bids-container").innerHTML = bidsHtml || '<div style="padding:10px; color:var(--text-dim); text-align:center;">No bids</div>';
@@ -1250,7 +1270,9 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
         function switchMobileTab(tab) {
             const btns = document.querySelectorAll('.mobile-tab-btn');
             btns.forEach(b => b.classList.remove('active'));
-            event.target.classList.add('active');
+            if (event && event.target) {
+                event.target.classList.add('active');
+            }
 
             const pBook = document.getElementById('panel-orderbook');
             const pChart = document.getElementById('panel-chart');
@@ -1268,7 +1290,14 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
                 pOrders.style.display = 'flex';
             } else if (tab === 'chart') {
                 pChart.style.display = 'block';
-                if (chart) chart.resize(window.innerWidth, 220);
+                if (!chart) {
+                    initChart();
+                } else {
+                    const w = pChart.clientWidth || window.innerWidth || 375;
+                    const h = 260;
+                    chart.applyOptions({ width: w, height: h });
+                    chart.timeScale().fitContent();
+                }
             } else if (tab === 'orderbook') {
                 pBook.style.display = 'flex';
             } else if (tab === 'orders') {
@@ -1298,7 +1327,6 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
             ws.onopen = () => {
                 wsRetryCount = 0;
                 updateWSStatus("connected", "● WS LIVE (<50µs)");
-                // Fetch fresh state on reconnect
                 fetch("/api/v1/orderbook").then(r => r.json()).then(renderOrderBook);
                 fetch("/api/v1/account").then(r => r.json()).then(renderAccount);
             };
