@@ -20,19 +20,33 @@ import (
 	"apextrade/pkg/websocket"
 )
 
+// OrderHistoryItem records completed or canceled user orders.
+type OrderHistoryItem struct {
+	ID          string              `json:"id"`
+	Symbol      string              `json:"symbol"`
+	Side        orderbook.Side      `json:"side"`
+	Type        orderbook.OrderType `json:"type"`
+	Price       float64             `json:"price"`
+	Amount      float64             `json:"amount"`
+	Filled      float64             `json:"filled"`
+	Status      string              `json:"status"` // "FILLED" or "CANCELED"
+	CompletedAt time.Time           `json:"completed_at"`
+}
+
 type Server struct {
-	engine   *engine.MatchingEngine
-	ledger   *ledger.Ledger
-	hub      *websocket.Hub
-	demoUser *ledger.UserAccount
-	userOrders map[string]*orderbook.Order
-	mu       sync.Mutex
+	engine       *engine.MatchingEngine
+	ledger       *ledger.Ledger
+	hub          *websocket.Hub
+	demoUser     *ledger.UserAccount
+	userOrders   map[string]*orderbook.Order
+	orderHistory []*OrderHistoryItem
+	mu           sync.Mutex
 }
 
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8081" // Default port 8081 to avoid conflict with gopherflow on 8080
+		port = "8081" // Default port 8081
 	}
 
 	symbol := "ETH/USDT"
@@ -48,11 +62,12 @@ func main() {
 	})
 
 	server := &Server{
-		engine:     matchingEngine,
-		ledger:     led,
-		hub:        hub,
-		demoUser:   demoUser,
-		userOrders: make(map[string]*orderbook.Order),
+		engine:       matchingEngine,
+		ledger:       led,
+		hub:          hub,
+		demoUser:     demoUser,
+		userOrders:   make(map[string]*orderbook.Order),
+		orderHistory: make([]*OrderHistoryItem, 0),
 	}
 
 	// 2. Start Background Autonomous Market Maker (Liquidity Generator)
@@ -65,6 +80,7 @@ func main() {
 	mux.HandleFunc("GET /api/v1/account", server.handleGetAccount)
 	mux.HandleFunc("GET /api/v1/orderbook", server.handleGetOrderBook)
 	mux.HandleFunc("GET /api/v1/trades", server.handleGetTrades)
+	mux.HandleFunc("GET /api/v1/candles", server.handleGetCandles)
 	mux.HandleFunc("POST /api/v1/orders", server.handlePlaceOrder)
 	mux.HandleFunc("DELETE /api/v1/orders/", server.handleCancelOrder)
 	mux.HandleFunc("POST /api/v1/faucet", server.handleFaucet)
@@ -85,7 +101,7 @@ func main() {
 		_ = httpServer.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("🚀 ApexTrade Matching Engine & Terminal running on http://localhost:%s", port)
+	log.Printf("🚀 ApexTrade Matching Engine & Responsive Terminal running on http://localhost:%s", port)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}
@@ -102,8 +118,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 	acc, _ := s.ledger.GetAccount(s.demoUser.ID)
+	s.mu.Lock()
+	var activeOrders []*orderbook.Order
+	for _, o := range s.userOrders {
+		if !o.IsFilled() {
+			activeOrders = append(activeOrders, o)
+		}
+	}
+	historyCopy := make([]*OrderHistoryItem, len(s.orderHistory))
+	copy(historyCopy, s.orderHistory)
+	s.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(acc)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"account":       acc,
+		"active_orders": activeOrders,
+		"order_history": historyCopy,
+	})
 }
 
 func (s *Server) handleGetOrderBook(w http.ResponseWriter, r *http.Request) {
@@ -117,9 +148,50 @@ func (s *Server) handleGetOrderBook(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetTrades(w http.ResponseWriter, r *http.Request) {
-	trades := s.engine.GetRecentTrades(25)
+	trades := s.engine.GetRecentTrades(30)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(trades)
+}
+
+func (s *Server) handleGetCandles(w http.ResponseWriter, r *http.Request) {
+	// Generate realistic 1-minute historical candles around 3000.0
+	now := time.Now().Unix()
+	start := now - (60 * 60) // Last 60 minutes
+	var candles []map[string]any
+	currPrice := 2990.0
+
+	for t := start; t <= now; t += 60 {
+		delta := (rand.Float64() - 0.49) * 4.0
+		open := currPrice
+		closePrice := currPrice + delta
+		high := mathMax(open, closePrice) + rand.Float64()*2.0
+		low := mathMin(open, closePrice) - rand.Float64()*2.0
+		candles = append(candles, map[string]any{
+			"time":  t,
+			"open":  open,
+			"high":  high,
+			"low":   low,
+			"close": closePrice,
+		})
+		currPrice = closePrice
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(candles)
+}
+
+func mathMax(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func mathMin(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (s *Server) handleFaucet(w http.ResponseWriter, r *http.Request) {
@@ -179,14 +251,26 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Settle Balances for each matched trade
 	for _, trd := range trades {
-		isBuyerMaker := trd.MakerOrderID == trd.TakerOrderID // or check maker side
+		isBuyerMaker := trd.MakerOrderID == trd.TakerOrderID
 		_ = s.ledger.SettleTrade(trd.BuyerID, trd.SellerID, "ETH", "USDT", trd.Amount, trd.Price, isBuyerMaker)
 		s.hub.BroadcastJSON("TRADE_TICKER", trd)
 	}
 
-	// 4. Save to User Active Orders if resting
+	// 4. Update user active orders and order history
 	s.mu.Lock()
-	if order.Remaining() > 0 && order.Type == orderbook.OrderTypeLimit {
+	if order.IsFilled() {
+		s.orderHistory = append(s.orderHistory, &OrderHistoryItem{
+			ID:          order.ID,
+			Symbol:      order.Symbol,
+			Side:        order.Side,
+			Type:        order.Type,
+			Price:       order.Price,
+			Amount:      order.Amount,
+			Filled:      order.Filled,
+			Status:      "FILLED",
+			CompletedAt: time.Now().UTC(),
+		})
+	} else if order.Type == orderbook.OrderTypeLimit {
 		s.userOrders[order.ID] = order
 	}
 	s.mu.Unlock()
@@ -225,6 +309,17 @@ func (s *Server) handleCancelOrder(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	delete(s.userOrders, orderID)
+	s.orderHistory = append(s.orderHistory, &OrderHistoryItem{
+		ID:          canceled.ID,
+		Symbol:      canceled.Symbol,
+		Side:        canceled.Side,
+		Type:        canceled.Type,
+		Price:       canceled.Price,
+		Amount:      canceled.Amount,
+		Filled:      canceled.Filled,
+		Status:      "CANCELED",
+		CompletedAt: time.Now().UTC(),
+	})
 	s.mu.Unlock()
 
 	s.broadcastOrderBookUpdate()
@@ -252,15 +347,18 @@ func (s *Server) broadcastAccountUpdate() {
 			activeOrders = append(activeOrders, o)
 		}
 	}
+	historyCopy := make([]*OrderHistoryItem, len(s.orderHistory))
+	copy(historyCopy, s.orderHistory)
 	s.mu.Unlock()
 
 	s.hub.BroadcastJSON("ACCOUNT_UPDATE", map[string]any{
-		"account": acc,
-		"orders":  activeOrders,
+		"account":       acc,
+		"active_orders": activeOrders,
+		"order_history": historyCopy,
 	})
 }
 
-// startMarketMakerBot creates realistic depth and occasional fills around the market price
+// startMarketMakerBot creates continuous depth and fills around the market price
 func (s *Server) startMarketMakerBot(symbol string) {
 	botID := "bot-market-maker"
 	s.ledger.RegisterUser(botID, "Liquidity Provider", map[string]float64{
@@ -286,11 +384,9 @@ func (s *Server) startMarketMakerBot(symbol string) {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// Random small price fluctuation
 		delta := (rand.Float64() - 0.5) * 4.0
 		newMid := basePrice + delta
 
-		// Insert/refresh top quotes
 		side := orderbook.SideBuy
 		if rand.Float64() > 0.5 {
 			side = orderbook.SideSell
@@ -324,8 +420,10 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ApexTrade | Ultra-Fast Crypto Matching Engine</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ApexTrade | Ultra-Fast Crypto DEX & Terminal</title>
+    <!-- TradingView Lightweight Charts CDN -->
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
     <style>
         :root {
             --bg: #0b0e14;
@@ -338,62 +436,94 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
             --green-dim: rgba(14, 203, 129, 0.15);
             --red: #f6465d;
             --red-dim: rgba(246, 70, 93, 0.15);
-            --accent: #fcd535;
+            --amber: #fcd535;
+            --amber-dim: rgba(252, 213, 53, 0.15);
+            --touch-target: 44px;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
             background-color: var(--bg);
             color: var(--text);
-            height: 100vh;
+            min-height: 100vh;
             display: flex;
             flex-direction: column;
-            overflow: hidden;
+            overflow-x: hidden;
         }
-        /* Top Navigation */
+        /* Top Navigation Bar */
         .navbar {
-            height: 52px;
+            height: 56px;
             background: var(--surface);
             border-bottom: 1px solid var(--border);
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 0 20px;
+            padding: 0 16px;
+            flex-shrink: 0;
+            z-index: 10;
         }
         .nav-brand {
             display: flex;
             align-items: center;
-            gap: 10px;
-            font-size: 18px;
-            font-weight: bold;
+            gap: 8px;
+            font-size: 17px;
+            font-weight: 800;
             color: #fff;
+            white-space: nowrap;
         }
-        .nav-brand span { color: var(--accent); }
-        .nav-pair {
+        .nav-brand span { color: var(--amber); }
+        .nav-stats {
             display: flex;
             align-items: center;
-            gap: 15px;
-            font-size: 14px;
+            gap: 16px;
+            font-size: 13px;
         }
-        .pair-price { font-size: 18px; font-weight: bold; color: var(--green); }
-        .ws-badge {
-            background: var(--green-dim);
+        .pair-badge {
+            font-size: 16px;
+            font-weight: 700;
             color: var(--green);
-            padding: 4px 10px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        /* WebSocket Resilient Indicator */
+        .ws-badge {
+            padding: 6px 12px;
             border-radius: 20px;
             font-size: 11px;
-            font-weight: bold;
-            display: flex;
+            font-weight: 700;
+            display: inline-flex;
             align-items: center;
             gap: 6px;
+            min-height: 32px;
+            cursor: pointer;
+            transition: 0.2s;
         }
-        .ws-dot { width: 6px; height: 6px; background: var(--green); border-radius: 50%; }
+        .ws-badge.connected { background: var(--green-dim); color: var(--green); }
+        .ws-badge.reconnecting { background: var(--amber-dim); color: var(--amber); }
+        .ws-badge.disconnected { background: var(--red-dim); color: var(--red); }
+        .ws-dot { width: 8px; height: 8px; border-radius: 50%; }
+        .ws-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
+        .ws-dot.reconnecting { background: var(--amber); animation: pulse 1s infinite; }
+        .ws-dot.disconnected { background: var(--red); }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
-        /* Main Workspace Layout */
-        .main-layout {
+        /* Skeleton Shimmer Loading */
+        .skeleton {
+            background: linear-gradient(90deg, #181f2c 25%, #232d3f 50%, #181f2c 75%);
+            background-size: 200% 100%;
+            animation: shimmer 1.5s infinite;
+            border-radius: 4px;
+        }
+        @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+        /* Workspace Grid Layout - Desktop (>= 1024px) */
+        .main-workspace {
             display: grid;
-            grid-template-columns: 320px 1fr 340px;
+            grid-template-columns: 310px 1fr 340px;
             flex: 1;
+            height: calc(100vh - 56px);
             overflow: hidden;
         }
         .panel {
@@ -402,17 +532,21 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
             display: flex;
             flex-direction: column;
             overflow: hidden;
+            position: relative;
         }
         .panel-header {
-            padding: 10px 15px;
+            padding: 10px 14px;
             border-bottom: 1px solid var(--border);
-            font-size: 12px;
-            font-weight: bold;
+            font-size: 11px;
+            font-weight: 700;
             color: var(--text-dim);
             text-transform: uppercase;
             letter-spacing: 0.5px;
             display: flex;
             justify-content: space-between;
+            align-items: center;
+            background: var(--surface);
+            flex-shrink: 0;
         }
 
         /* Order Book Table */
@@ -421,60 +555,106 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
             overflow-y: auto;
             font-size: 12px;
         }
+        .ob-header-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            padding: 6px 14px;
+            font-size: 11px;
+            color: var(--text-dim);
+            border-bottom: 1px solid var(--border);
+            background: var(--surface-card);
+        }
         .ob-row {
             display: grid;
             grid-template-columns: 1fr 1fr 1fr;
-            padding: 4px 15px;
+            padding: 0 14px;
+            min-height: 28px;
+            align-items: center;
             position: relative;
             cursor: pointer;
+            user-select: none;
         }
-        .ob-row:hover { background: rgba(255,255,255,0.05); }
+        .ob-row:hover { background: rgba(255,255,255,0.06); }
         .ob-bar {
             position: absolute;
             top: 0; bottom: 0; right: 0;
             pointer-events: none;
-            opacity: 0.25;
+            opacity: 0.22;
         }
         .ob-bar.ask { background: var(--red); }
         .ob-bar.bid { background: var(--green); }
         .mid-price-bar {
-            padding: 8px 15px;
+            padding: 8px 14px;
             background: var(--surface-card);
-            font-size: 15px;
-            font-weight: bold;
+            font-size: 14px;
+            font-weight: 800;
             color: var(--text);
-            text-align: center;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             border-top: 1px solid var(--border);
             border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
         }
 
-        /* Order Placement Center Form */
-        .order-form-panel {
-            padding: 20px;
+        /* Center Column Layout */
+        .center-column {
             display: flex;
             flex-direction: column;
-            gap: 15px;
-            max-width: 480px;
+            overflow-y: auto;
+            background: var(--bg);
+        }
+        .chart-container {
+            height: 280px;
+            width: 100%;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            position: relative;
+            flex-shrink: 0;
+        }
+        .chart-header {
+            position: absolute;
+            top: 10px;
+            left: 14px;
+            z-index: 5;
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--text-dim);
+            pointer-events: none;
+        }
+
+        /* Order Placement Form */
+        .order-form-container {
+            padding: 18px;
+            max-width: 520px;
             margin: 0 auto;
             width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
         }
         .tab-group {
             display: flex;
             background: var(--surface-card);
-            border-radius: 6px;
+            border-radius: 8px;
             padding: 3px;
+            gap: 4px;
         }
         .tab-btn {
             flex: 1;
-            padding: 8px;
+            min-height: var(--touch-target);
             border: none;
             background: transparent;
             color: var(--text-dim);
-            font-weight: bold;
+            font-weight: 700;
             font-size: 13px;
-            border-radius: 4px;
+            border-radius: 6px;
             cursor: pointer;
             transition: 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
         }
         .tab-btn.active.buy { background: var(--green); color: #fff; }
         .tab-btn.active.sell { background: var(--red); color: #fff; }
@@ -485,116 +665,283 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
             flex-direction: column;
             gap: 6px;
         }
-        .input-label { font-size: 12px; color: var(--text-dim); }
+        .input-label { font-size: 12px; color: var(--text-dim); font-weight: 600; }
         .input-box {
-            background: var(--bg);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0 14px;
+            height: var(--touch-target);
+            color: #fff;
+            font-size: 15px;
+            outline: none;
+            font-weight: 600;
+        }
+        .input-box:focus { border-color: var(--amber); }
+
+        .pct-buttons {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 6px;
+        }
+        .pct-btn {
+            height: 32px;
+            background: var(--surface-card);
             border: 1px solid var(--border);
             border-radius: 6px;
-            padding: 10px 12px;
-            color: #fff;
-            font-size: 14px;
-            outline: none;
+            color: var(--text-dim);
+            font-size: 11px;
+            font-weight: 700;
+            cursor: pointer;
         }
-        .input-box:focus { border-color: var(--accent); }
+        .pct-btn:hover { color: #fff; border-color: var(--text-dim); }
 
         .btn-submit {
-            padding: 14px;
+            height: var(--touch-target);
             border: none;
-            border-radius: 6px;
+            border-radius: 8px;
             font-size: 15px;
-            font-weight: bold;
+            font-weight: 800;
             cursor: pointer;
             transition: 0.2s;
             color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 4px;
         }
         .btn-submit.buy { background: var(--green); }
         .btn-submit.buy:hover { background: #0ca86b; }
         .btn-submit.sell { background: var(--red); }
         .btn-submit.sell:hover { background: #d9384e; }
 
-        /* Trade Tape & Portfolio */
-        .tape-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            padding: 4px 15px;
-            font-size: 12px;
-        }
-        .balance-card {
-            background: var(--surface-card);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 12px 15px;
-            margin: 10px 15px;
-            font-size: 13px;
-        }
-        .faucet-btn {
-            background: var(--accent);
-            color: #000;
-            border: none;
-            padding: 6px 12px;
-            border-radius: 4px;
-            font-weight: bold;
-            font-size: 11px;
-            cursor: pointer;
-            margin-top: 8px;
-            width: 100%;
-        }
-
-        /* Active Orders Table */
-        .bottom-panel {
-            height: 140px;
+        /* User Orders Tabs & Table */
+        .user-orders-section {
             background: var(--surface);
             border-top: 1px solid var(--border);
-            overflow-y: auto;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 180px;
+        }
+        .subtabs {
+            display: flex;
+            border-bottom: 1px solid var(--border);
+            padding: 0 14px;
+            gap: 16px;
+            background: var(--surface-card);
+        }
+        .subtab-item {
+            padding: 12px 4px;
             font-size: 12px;
-            padding: 10px 20px;
+            font-weight: 700;
+            color: var(--text-dim);
+            border-bottom: 2px solid transparent;
+            cursor: pointer;
+        }
+        .subtab-item.active {
+            color: #fff;
+            border-bottom-color: var(--amber);
+        }
+        .orders-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        .orders-table th {
+            padding: 8px 14px;
+            color: var(--text-dim);
+            text-align: left;
+            font-weight: 600;
+            background: var(--surface);
+        }
+        .orders-table td {
+            padding: 8px 14px;
+            border-bottom: 1px solid var(--border);
         }
         .cancel-btn {
             background: var(--red-dim);
             color: var(--red);
-            border: none;
-            padding: 2px 8px;
-            border-radius: 3px;
+            border: 1px solid var(--red);
+            padding: 4px 10px;
+            border-radius: 4px;
             font-size: 11px;
-            font-weight: bold;
+            font-weight: 700;
             cursor: pointer;
+            min-height: 28px;
+        }
+        .cancel-btn:hover { background: var(--red); color: #fff; }
+
+        /* Right Panel: Portfolio & Trades */
+        .balance-card {
+            background: var(--surface-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px;
+            margin: 12px;
+            font-size: 13px;
+        }
+        .faucet-btn {
+            background: var(--amber);
+            color: #000;
+            border: none;
+            height: var(--touch-target);
+            border-radius: 6px;
+            font-weight: 800;
+            font-size: 13px;
+            cursor: pointer;
+            margin-top: 10px;
+            width: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+        .faucet-btn:hover { background: #e5bf2a; }
+
+        .tape-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            padding: 5px 14px;
+            font-size: 12px;
+            align-items: center;
+        }
+
+        /* Mobile Viewport Breakpoint Switcher (< 768px) */
+        .mobile-tab-bar {
+            display: none;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            overflow-x: auto;
+            white-space: nowrap;
+            padding: 4px 8px;
+            gap: 4px;
+            flex-shrink: 0;
+        }
+        .mobile-tab-btn {
+            padding: 8px 14px;
+            min-height: var(--touch-target);
+            border-radius: 6px;
+            border: none;
+            background: transparent;
+            color: var(--text-dim);
+            font-size: 12px;
+            font-weight: 700;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .mobile-tab-btn.active {
+            background: var(--surface-card);
+            color: var(--amber);
+            border: 1px solid var(--border);
+        }
+
+        /* RESPONSIVE BREAKPOINTS */
+        @media (max-width: 1023px) {
+            .main-workspace {
+                grid-template-columns: 280px 1fr;
+            }
+            .panel.right-panel {
+                display: none;
+            }
+        }
+
+        @media (max-width: 768px) {
+            body { overflow-y: auto; }
+            .navbar { padding: 0 12px; }
+            .nav-stats { display: none; }
+            .mobile-tab-bar { display: flex; }
+            .main-workspace {
+                display: flex;
+                flex-direction: column;
+                height: auto;
+                overflow: visible;
+            }
+            .chart-container { height: 220px; }
+            .panel {
+                border-right: none;
+                border-bottom: 1px solid var(--border);
+            }
+            .ob-row { min-height: var(--touch-target); }
+            .mobile-hide { display: none !important; }
+            .mobile-show { display: flex !important; }
         }
     </style>
 </head>
 <body>
+    <!-- Top Bar -->
     <div class="navbar">
         <div class="nav-brand">
             ⚡ <span>ApexTrade</span> DEX
         </div>
-        <div class="nav-pair">
-            <strong>ETH / USDT</strong>
-            <span class="pair-price" id="top-price">$3,000.00</span>
+        <div class="nav-stats">
+            <span class="pair-badge">
+                <span id="price-arrow">▲</span> ETH/USDT: <strong id="top-price">$3,000.00</strong>
+            </span>
             <span style="color: var(--text-dim); font-size: 12px;">24h Vol: 1,420.50 ETH</span>
         </div>
-        <div class="ws-badge">
-            <div class="ws-dot"></div> WS LIVE ( < 50µs )
+        <div class="ws-badge connected" id="ws-status" onclick="connectWS()">
+            <div class="ws-dot connected" id="ws-dot"></div>
+            <span id="ws-text">● WS LIVE (<50µs)</span>
         </div>
     </div>
 
-    <div class="main-layout">
-        <!-- Left: Live Order Book -->
-        <div class="panel">
+    <!-- Mobile Tab Switcher (Appears below 768px) -->
+    <div class="mobile-tab-bar">
+        <button class="mobile-tab-btn active" onclick="switchMobileTab('trade')">⚡ Trade Panel</button>
+        <button class="mobile-tab-btn" onclick="switchMobileTab('chart')">📈 Chart</button>
+        <button class="mobile-tab-btn" onclick="switchMobileTab('orderbook')">📖 Order Book</button>
+        <button class="mobile-tab-btn" onclick="switchMobileTab('orders')">📋 Orders & History</button>
+        <button class="mobile-tab-btn" onclick="switchMobileTab('portfolio')">💰 Portfolio & Tape</button>
+    </div>
+
+    <!-- Main Workspace -->
+    <div class="main-workspace">
+        <!-- Left: Order Book Panel -->
+        <div class="panel" id="panel-orderbook">
             <div class="panel-header">
-                <span>Price (USDT)</span>
-                <span>Size (ETH)</span>
-                <span>Total</span>
+                <span>📖 Live Order Book (L2)</span>
+                <span style="font-size:10px; color:var(--green);">FIFO Priority</span>
             </div>
-            <div class="orderbook-table" id="asks-container" style="display:flex; flex-direction:column-reverse; justify-content:flex-end;"></div>
-            <div class="mid-price-bar" id="mid-price">$3,000.00</div>
-            <div class="orderbook-table" id="bids-container"></div>
+            <div class="ob-header-grid">
+                <span>Price (USDT)</span>
+                <span style="text-align:center;">Size (ETH)</span>
+                <span style="text-align:right;">Total</span>
+            </div>
+            <div class="orderbook-table" id="asks-container" style="display:flex; flex-direction:column-reverse; justify-content:flex-end;">
+                <!-- Skeleton Loader -->
+                <div class="ob-row skeleton" style="height:24px; margin:2px 0;"></div>
+                <div class="ob-row skeleton" style="height:24px; margin:2px 0;"></div>
+                <div class="ob-row skeleton" style="height:24px; margin:2px 0;"></div>
+            </div>
+            <div class="mid-price-bar">
+                <span style="font-size:11px; color:var(--text-dim);">SPREAD / MID:</span>
+                <span id="mid-price" style="color:var(--amber);">▲ $3,000.00</span>
+            </div>
+            <div class="orderbook-table" id="bids-container">
+                <!-- Skeleton Loader -->
+                <div class="ob-row skeleton" style="height:24px; margin:2px 0;"></div>
+                <div class="ob-row skeleton" style="height:24px; margin:2px 0;"></div>
+                <div class="ob-row skeleton" style="height:24px; margin:2px 0;"></div>
+            </div>
         </div>
 
-        <!-- Center: Order Placement Form & Active Orders -->
-        <div class="panel" style="background: var(--bg); display:flex; flex-direction:column; justify-content:space-between;">
-            <div class="order-form-panel">
+        <!-- Center: Interactive Candlestick Chart & Order Execution Panel -->
+        <div class="center-column" id="panel-center">
+            <!-- Candlestick Chart Section -->
+            <div class="chart-container" id="panel-chart">
+                <div class="chart-header">ETH/USDT • 1m Candlestick (Real-Time)</div>
+                <div id="tv-chart" style="width:100%; height:100%;"></div>
+            </div>
+
+            <!-- Order Placement Form -->
+            <div class="order-form-container" id="panel-trade">
                 <div class="tab-group">
-                    <button class="tab-btn active buy" id="tab-buy" onclick="setSide('BUY')">BUY ETH</button>
-                    <button class="tab-btn" id="tab-sell" onclick="setSide('SELL')">SELL ETH</button>
+                    <button class="tab-btn active buy" id="tab-buy" onclick="setSide('BUY')">▲ BUY ETH (+)</button>
+                    <button class="tab-btn" id="tab-sell" onclick="setSide('SELL')">▼ SELL ETH (-)</button>
                 </div>
                 <div class="tab-group">
                     <button class="tab-btn active type" id="tab-limit" onclick="setType('LIMIT')">Limit Order</button>
@@ -602,44 +949,66 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
                 </div>
 
                 <div class="input-group" id="price-group">
-                    <label class="input-label">Price (USDT)</label>
+                    <label class="input-label">Limit Price (USDT)</label>
                     <input class="input-box" type="number" id="input-price" value="3000.00" step="0.5">
                 </div>
 
                 <div class="input-group">
-                    <label class="input-label">Amount (ETH)</label>
+                    <label class="input-label">Order Amount (ETH)</label>
                     <input class="input-box" type="number" id="input-amount" value="1.0" step="0.1">
                 </div>
 
-                <button class="btn-submit buy" id="btn-submit-order" onclick="submitOrder()">Place Buy Order</button>
+                <div class="pct-buttons">
+                    <button class="pct-btn" onclick="setAmountPct(0.25)">25%</button>
+                    <button class="pct-btn" onclick="setAmountPct(0.50)">50%</button>
+                    <button class="pct-btn" onclick="setAmountPct(0.75)">75%</button>
+                    <button class="pct-btn" onclick="setAmountPct(1.00)">100%</button>
+                </div>
+
+                <button class="btn-submit buy" id="btn-submit-order" onclick="submitOrder()">▲ Place Buy Order (+)</button>
             </div>
 
-            <!-- Bottom Active Orders -->
-            <div class="bottom-panel">
-                <div style="font-weight:bold; color:var(--text-dim); margin-bottom:8px;">MY ACTIVE RESTING ORDERS</div>
-                <div id="active-orders-list">No resting limit orders.</div>
+            <!-- User Open Orders & Order History Subtabs -->
+            <div class="user-orders-section" id="panel-orders">
+                <div class="subtabs">
+                    <div class="subtab-item active" id="subtab-open" onclick="switchOrdersTab('open')">Open Orders (<span id="open-count">0</span>)</div>
+                    <div class="subtab-item" id="subtab-history" onclick="switchOrdersTab('history')">Order History (<span id="history-count">0</span>)</div>
+                </div>
+                <div style="flex:1; overflow-x:auto;">
+                    <div id="orders-content" style="padding: 10px 14px;">
+                        <span style="color:var(--text-dim); font-size:12px;">No resting limit orders.</span>
+                    </div>
+                </div>
             </div>
         </div>
 
-        <!-- Right: Real-Time Trade Tape & Virtual Portfolio -->
-        <div class="panel">
+        <!-- Right: Portfolio Balance & Recent Trades Tape -->
+        <div class="panel right-panel" id="panel-portfolio">
             <div class="balance-card">
-                <div style="color:var(--text-dim); font-size:11px; margin-bottom:4px;">DEMO TRADER PORTFOLIO</div>
-                <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
-                    <span>USDT Available:</span>
+                <div style="color:var(--text-dim); font-size:11px; margin-bottom:6px; font-weight:700;">💼 DEMO TRADER PORTFOLIO</div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span style="color:var(--text-dim);">USDT Available:</span>
                     <strong style="color:var(--green);" id="bal-usdt">$10,000.00</strong>
                 </div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                    <span style="color:var(--text-dim);">USDT In Escrow:</span>
+                    <strong style="color:var(--amber);" id="bal-usdt-locked">$0.00</strong>
+                </div>
                 <div style="display:flex; justify-content:space-between;">
-                    <span>ETH Available:</span>
+                    <span style="color:var(--text-dim);">ETH Available:</span>
                     <strong style="color:#fff;" id="bal-eth">5.00 ETH</strong>
                 </div>
                 <button class="faucet-btn" onclick="claimFaucet()">+ Claim Free $5,000 Faucet</button>
             </div>
 
             <div class="panel-header">
-                <span>Recent Trades</span>
-                <span>Size</span>
-                <span>Time</span>
+                <span>⚡ Live Trade Tape</span>
+                <span style="font-size:10px;">Time</span>
+            </div>
+            <div class="ob-header-grid">
+                <span>Price (USDT)</span>
+                <span style="text-align:center;">Size (ETH)</span>
+                <span style="text-align:right;">Time</span>
             </div>
             <div class="orderbook-table" id="trade-tape"></div>
         </div>
@@ -648,6 +1017,58 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
     <script>
         let currentSide = "BUY";
         let currentType = "LIMIT";
+        let currentOrdersTab = "open";
+        let latestAccountData = { account: null, active_orders: [], order_history: [] };
+        let chart = null;
+        let candleSeries = null;
+        let wsRetryCount = 0;
+        let ws = null;
+
+        // Initialize TradingView Candlestick Chart
+        function initChart() {
+            const chartContainer = document.getElementById('tv-chart');
+            if (!chartContainer || typeof LightweightCharts === 'undefined') return;
+
+            chart = LightweightCharts.createChart(chartContainer, {
+                layout: {
+                    background: { color: '#121721' },
+                    textColor: '#7d8590',
+                },
+                grid: {
+                    vertLines: { color: '#181f2c' },
+                    horzLines: { color: '#181f2c' },
+                },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                timeScale: { timeVisible: true, secondsVisible: false },
+            });
+
+            candleSeries = chart.addCandlestickSeries({
+                upColor: '#0ecb81',
+                downColor: '#f6465d',
+                borderVisible: false,
+                wickUpColor: '#0ecb81',
+                wickDownColor: '#f6465d',
+            });
+
+            // Load historical candles
+            fetch('/api/v1/candles')
+                .then(r => r.json())
+                .then(data => {
+                    if (data && data.length) {
+                        candleSeries.setData(data);
+                    }
+                })
+                .catch(err => console.error("Candle fetch error:", err));
+
+            // Auto-resize chart on window change
+            const resizeObserver = new ResizeObserver(entries => {
+                if (entries.length && chart) {
+                    const { width, height } = entries[0].contentRect;
+                    chart.applyOptions({ width, height });
+                }
+            });
+            resizeObserver.observe(chartContainer);
+        }
 
         function setSide(side) {
             currentSide = side;
@@ -655,7 +1076,8 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
             document.getElementById("tab-sell").className = "tab-btn " + (side === "SELL" ? "active sell" : "");
             const submitBtn = document.getElementById("btn-submit-order");
             submitBtn.className = "btn-submit " + (side === "BUY" ? "buy" : "sell");
-            submitBtn.innerText = "Place " + (side === "BUY" ? "Buy" : "Sell") + " Order";
+            const prefix = side === "BUY" ? "▲ Place Buy Order (+)" : "▼ Place Sell Order (-)";
+            submitBtn.innerText = prefix;
         }
 
         function setType(type) {
@@ -663,6 +1085,19 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
             document.getElementById("tab-limit").className = "tab-btn " + (type === "LIMIT" ? "active type" : "");
             document.getElementById("tab-market").className = "tab-btn " + (type === "MARKET" ? "active type" : "");
             document.getElementById("price-group").style.display = type === "MARKET" ? "none" : "flex";
+        }
+
+        function setAmountPct(pct) {
+            if (!latestAccountData.account || !latestAccountData.account.balances) return;
+            const price = parseFloat(document.getElementById("input-price").value) || 3000.0;
+            if (currentSide === "BUY") {
+                const usdt = latestAccountData.account.balances.USDT ? latestAccountData.account.balances.USDT.available : 0;
+                const maxEth = (usdt * pct) / price;
+                document.getElementById("input-amount").value = maxEth.toFixed(2);
+            } else {
+                const eth = latestAccountData.account.balances.ETH ? latestAccountData.account.balances.ETH.available : 0;
+                document.getElementById("input-amount").value = (eth * pct).toFixed(2);
+            }
         }
 
         function renderOrderBook(data) {
@@ -675,30 +1110,30 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
 
             let asksHtml = asks.map(a => {
                 const width = Math.min(100, (a.volume / maxVol) * 100);
-                return '<div class="ob-row" onclick="fillPrice(' + a.price + ')">' +
+                return '<div class="ob-row" onclick="fillPrice(' + a.price + ')" role="button" aria-label="Ask price ' + a.price + '">' +
                     '<div class="ob-bar ask" style="width:' + width + '%;"></div>' +
-                    '<span style="color:var(--red);">' + a.price.toFixed(2) + '</span>' +
-                    '<span>' + a.volume.toFixed(2) + '</span>' +
-                    '<span>' + (a.price * a.volume).toFixed(0) + '</span>' +
+                    '<span style="color:var(--red); font-weight:700;">▼ ' + a.price.toFixed(2) + '</span>' +
+                    '<span style="text-align:center;">' + a.volume.toFixed(2) + '</span>' +
+                    '<span style="text-align:right;">' + (a.price * a.volume).toFixed(0) + '</span>' +
                 '</div>';
             }).join('');
-            document.getElementById("asks-container").innerHTML = asksHtml;
+            document.getElementById("asks-container").innerHTML = asksHtml || '<div style="padding:10px; color:var(--text-dim); text-align:center;">No asks</div>';
 
             let bidsHtml = bids.map(b => {
                 const width = Math.min(100, (b.volume / maxVol) * 100);
-                return '<div class="ob-row" onclick="fillPrice(' + b.price + ')">' +
+                return '<div class="ob-row" onclick="fillPrice(' + b.price + ')" role="button" aria-label="Bid price ' + b.price + '">' +
                     '<div class="ob-bar bid" style="width:' + width + '%;"></div>' +
-                    '<span style="color:var(--green);">' + b.price.toFixed(2) + '</span>' +
-                    '<span>' + b.volume.toFixed(2) + '</span>' +
-                    '<span>' + (b.price * b.volume).toFixed(0) + '</span>' +
+                    '<span style="color:var(--green); font-weight:700;">▲ ' + b.price.toFixed(2) + '</span>' +
+                    '<span style="text-align:center;">' + b.volume.toFixed(2) + '</span>' +
+                    '<span style="text-align:right;">' + (b.price * b.volume).toFixed(0) + '</span>' +
                 '</div>';
             }).join('');
-            document.getElementById("bids-container").innerHTML = bidsHtml;
+            document.getElementById("bids-container").innerHTML = bidsHtml || '<div style="padding:10px; color:var(--text-dim); text-align:center;">No bids</div>';
 
             if (bids.length > 0 && asks.length > 0) {
                 const mid = ((bids[0].price + asks[0].price) / 2).toFixed(2);
-                document.getElementById("mid-price").innerText = "$" + mid;
-                document.getElementById("top-price").innerText = "$" + mid;
+                document.getElementById("mid-price").innerHTML = '▲ $' + mid;
+                document.getElementById("top-price").innerText = '$' + mid;
             }
         }
 
@@ -709,51 +1144,164 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
         function renderTrade(trd) {
             const tape = document.getElementById("trade-tape");
             const isBuy = trd.buyer_id === "demo-user" || Math.random() > 0.5;
+            const prefix = isBuy ? "▲ +" : "▼ -";
             const color = isBuy ? "var(--green)" : "var(--red)";
             const timeStr = new Date().toLocaleTimeString();
 
             const row = document.createElement("div");
             row.className = "tape-row";
             row.innerHTML = 
-                '<span style="color:' + color + ';">' + trd.price.toFixed(2) + '</span>' +
-                '<span>' + trd.amount.toFixed(2) + '</span>' +
-                '<span style="color:var(--text-dim);">' + timeStr + '</span>';
+                '<span style="color:' + color + '; font-weight:700;">' + prefix + trd.price.toFixed(2) + '</span>' +
+                '<span style="text-align:center;">' + trd.amount.toFixed(2) + '</span>' +
+                '<span style="color:var(--text-dim); text-align:right;">' + timeStr + '</span>';
             tape.insertBefore(row, tape.firstChild);
             if (tape.children.length > 30) tape.removeChild(tape.lastChild);
+
+            // Update live candle tick
+            if (candleSeries) {
+                const nowSec = Math.floor(Date.now() / 1000);
+                candleSeries.update({
+                    time: nowSec - (nowSec % 60),
+                    open: trd.price,
+                    high: trd.price + 0.5,
+                    low: trd.price - 0.5,
+                    close: trd.price
+                });
+            }
         }
 
         function renderAccount(data) {
+            latestAccountData = data;
             if (data.account && data.account.balances) {
-                const usdt = data.account.balances.USDT ? data.account.balances.USDT.available : 0;
-                const eth = data.account.balances.ETH ? data.account.balances.ETH.available : 0;
-                document.getElementById("bal-usdt").innerText = "$" + usdt.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-                document.getElementById("bal-eth").innerText = eth.toFixed(2) + " ETH";
+                const usdtAvail = data.account.balances.USDT ? data.account.balances.USDT.available : 0;
+                const usdtLocked = data.account.balances.USDT ? data.account.balances.USDT.locked : 0;
+                const ethAvail = data.account.balances.ETH ? data.account.balances.ETH.available : 0;
+                document.getElementById("bal-usdt").innerText = "$" + usdtAvail.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                document.getElementById("bal-usdt-locked").innerText = "$" + usdtLocked.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                document.getElementById("bal-eth").innerText = ethAvail.toFixed(2) + " ETH";
             }
 
-            const orders = data.orders || [];
-            if (orders.length === 0) {
-                document.getElementById("active-orders-list").innerHTML = '<span style="color:var(--text-dim);">No resting limit orders.</span>';
-            } else {
-                let html = '<table style="width:100%; text-align:left;">' +
-                    '<tr style="color:var(--text-dim);"><th>Side</th><th>Price</th><th>Remaining</th><th>Action</th></tr>';
+            const activeOrders = data.active_orders || [];
+            const history = data.order_history || [];
+            document.getElementById("open-count").innerText = activeOrders.length;
+            document.getElementById("history-count").innerText = history.length;
+
+            renderOrdersTable();
+        }
+
+        function switchOrdersTab(tab) {
+            currentOrdersTab = tab;
+            document.getElementById("subtab-open").className = "subtab-item " + (tab === "open" ? "active" : "");
+            document.getElementById("subtab-history").className = "subtab-item " + (tab === "history" ? "active" : "");
+            renderOrdersTable();
+        }
+
+        function renderOrdersTable() {
+            const container = document.getElementById("orders-content");
+            if (currentOrdersTab === "open") {
+                const orders = latestAccountData.active_orders || [];
+                if (orders.length === 0) {
+                    container.innerHTML = '<span style="color:var(--text-dim); font-size:12px;">No active resting limit orders.</span>';
+                    return;
+                }
+                let html = '<table class="orders-table">' +
+                    '<tr><th>Side</th><th>Price</th><th>Remaining</th><th>Time</th><th>Action</th></tr>';
                 orders.forEach(o => {
-                    const sideColor = o.side === "BUY" ? "var(--green)" : "var(--red)";
+                    const isBuy = o.side === "BUY";
+                    const color = isBuy ? "var(--green)" : "var(--red)";
+                    const prefix = isBuy ? "▲ BUY" : "▼ SELL";
                     html += '<tr>' +
-                        '<td style="color:' + sideColor + ';">' + o.side + '</td>' +
+                        '<td style="color:' + color + '; font-weight:700;">' + prefix + '</td>' +
                         '<td>$' + o.price.toFixed(2) + '</td>' +
                         '<td>' + (o.amount - o.filled).toFixed(2) + ' ETH</td>' +
-                        '<td><button class="cancel-btn" onclick="cancelOrder(\'' + o.id + '\')">Cancel</button></td>' +
+                        '<td style="color:var(--text-dim);">' + new Date().toLocaleTimeString() + '</td>' +
+                        '<td><button class="cancel-btn" onclick="cancelOrder(\'' + o.id + '\')">✕ Cancel</button></td>' +
                     '</tr>';
                 });
                 html += '</table>';
-                document.getElementById("active-orders-list").innerHTML = html;
+                container.innerHTML = html;
+            } else {
+                const history = latestAccountData.order_history || [];
+                if (history.length === 0) {
+                    container.innerHTML = '<span style="color:var(--text-dim); font-size:12px;">No past order history.</span>';
+                    return;
+                }
+                let html = '<table class="orders-table">' +
+                    '<tr><th>Side</th><th>Price</th><th>Filled Amount</th><th>Status</th><th>Completed</th></tr>';
+                history.forEach(h => {
+                    const isBuy = h.side === "BUY";
+                    const color = isBuy ? "var(--green)" : "var(--red)";
+                    const prefix = isBuy ? "▲ BUY" : "▼ SELL";
+                    const statusColor = h.status === "FILLED" ? "var(--green)" : "var(--red)";
+                    html += '<tr>' +
+                        '<td style="color:' + color + '; font-weight:700;">' + prefix + '</td>' +
+                        '<td>$' + h.price.toFixed(2) + '</td>' +
+                        '<td>' + h.filled.toFixed(2) + ' / ' + h.amount.toFixed(2) + ' ETH</td>' +
+                        '<td style="color:' + statusColor + '; font-weight:700;">' + h.status + '</td>' +
+                        '<td style="color:var(--text-dim);">' + new Date(h.completed_at).toLocaleTimeString() + '</td>' +
+                    '</tr>';
+                });
+                html += '</table>';
+                container.innerHTML = html;
             }
         }
 
-        // WebSocket Connection
+        // Mobile Viewport Switcher (< 768px)
+        function switchMobileTab(tab) {
+            const btns = document.querySelectorAll('.mobile-tab-btn');
+            btns.forEach(b => b.classList.remove('active'));
+            event.target.classList.add('active');
+
+            const pBook = document.getElementById('panel-orderbook');
+            const pChart = document.getElementById('panel-chart');
+            const pTrade = document.getElementById('panel-trade');
+            const pOrders = document.getElementById('panel-orders');
+            const pPort = document.getElementById('panel-portfolio');
+
+            // Hide all by default on mobile
+            [pBook, pChart, pTrade, pOrders, pPort].forEach(p => {
+                if (p) p.style.display = 'none';
+            });
+
+            if (tab === 'trade') {
+                pTrade.style.display = 'flex';
+                pOrders.style.display = 'flex';
+            } else if (tab === 'chart') {
+                pChart.style.display = 'block';
+                if (chart) chart.resize(window.innerWidth, 220);
+            } else if (tab === 'orderbook') {
+                pBook.style.display = 'flex';
+            } else if (tab === 'orders') {
+                pOrders.style.display = 'flex';
+            } else if (tab === 'portfolio') {
+                pPort.style.display = 'flex';
+                pPort.classList.remove('right-panel');
+            }
+        }
+
+        // WebSocket State Handling & Auto-Reconnect
+        function updateWSStatus(state, text) {
+            const badge = document.getElementById("ws-status");
+            const dot = document.getElementById("ws-dot");
+            const label = document.getElementById("ws-text");
+
+            badge.className = "ws-badge " + state;
+            dot.className = "ws-dot " + state;
+            label.innerText = text;
+        }
+
         function connectWS() {
+            updateWSStatus("reconnecting", "◌ CONNECTING...");
             const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-            const ws = new WebSocket(protocol + "//" + location.host + "/ws");
+            ws = new WebSocket(protocol + "//" + location.host + "/ws");
+
+            ws.onopen = () => {
+                wsRetryCount = 0;
+                updateWSStatus("connected", "● WS LIVE (<50µs)");
+                // Fetch fresh state on reconnect
+                fetch("/api/v1/orderbook").then(r => r.json()).then(renderOrderBook);
+                fetch("/api/v1/account").then(r => r.json()).then(renderAccount);
+            };
 
             ws.onmessage = (event) => {
                 const msg = JSON.parse(event.data);
@@ -762,8 +1310,15 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
                 if (msg.type === "ACCOUNT_UPDATE") renderAccount(msg.payload);
             };
 
+            ws.onerror = () => {
+                updateWSStatus("disconnected", "✕ WS DISCONNECTED");
+            };
+
             ws.onclose = () => {
-                setTimeout(connectWS, 2000); // Reconnect
+                wsRetryCount++;
+                const delay = Math.min(8000, 1000 * Math.pow(2, wsRetryCount));
+                updateWSStatus("reconnecting", "◌ RETRYING IN " + (delay / 1000) + "s...");
+                setTimeout(connectWS, delay);
             };
         }
 
@@ -799,11 +1354,19 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
             await fetch("/api/v1/faucet", { method: "POST" });
         }
 
-        // Initial Load
-        fetch("/api/v1/orderbook").then(r => r.json()).then(renderOrderBook);
-        fetch("/api/v1/account").then(r => r.json()).then(acc => renderAccount({account: acc}));
-        fetch("/api/v1/trades").then(r => r.json()).then(trades => trades.forEach(renderTrade));
-        connectWS();
+        // Initialize App
+        window.addEventListener('DOMContentLoaded', () => {
+            initChart();
+            fetch("/api/v1/orderbook").then(r => r.json()).then(renderOrderBook);
+            fetch("/api/v1/account").then(r => r.json()).then(renderAccount);
+            fetch("/api/v1/trades").then(r => r.json()).then(trades => trades.forEach(renderTrade));
+            connectWS();
+
+            // Set initial mobile view if viewport is small
+            if (window.innerWidth < 768) {
+                switchMobileTab('trade');
+            }
+        });
     </script>
 </body>
 </html>`
