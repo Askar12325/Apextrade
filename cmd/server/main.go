@@ -1025,69 +1025,151 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
         let currentType = "LIMIT";
         let currentOrdersTab = "open";
         let latestAccountData = { account: null, active_orders: [], order_history: [] };
-        let chart = null;
-        let candleSeries = null;
+        let candleData = [];
         let wsRetryCount = 0;
         let ws = null;
 
-        // Initialize TradingView Candlestick Chart
-        function initChart() {
-            const chartContainer = document.getElementById('tv-chart');
-            if (!chartContainer) return;
+        // Interactive High-Performance HTML5 Canvas Candlestick Chart
+        function drawCanvasChart() {
+            const container = document.getElementById('tv-chart');
+            if (!container) return;
 
-            if (typeof LightweightCharts === 'undefined') {
-                setTimeout(initChart, 250);
+            let canvas = document.getElementById('chart-canvas');
+            if (!canvas) {
+                container.innerHTML = '<canvas id="chart-canvas" style="display:block; width:100%; height:100%; cursor:crosshair;"></canvas>';
+                canvas = document.getElementById('chart-canvas');
+            }
+
+            const rect = container.getBoundingClientRect();
+            const width = rect.width || container.clientWidth || 375;
+            const height = rect.height || container.clientHeight || 260;
+
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = width * dpr;
+            canvas.height = height * dpr;
+            canvas.style.width = width + 'px';
+            canvas.style.height = height + 'px';
+
+            const ctx = canvas.getContext('2d');
+            ctx.scale(dpr, dpr);
+
+            // Background
+            ctx.fillStyle = '#121721';
+            ctx.fillRect(0, 0, width, height);
+
+            if (!candleData || candleData.length === 0) {
+                ctx.fillStyle = '#7d8590';
+                ctx.font = '12px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('Loading candlestick data...', width / 2, height / 2);
                 return;
             }
 
-            if (chart) return; // Prevent duplicate initialization
+            // Price boundaries
+            let minPrice = Infinity;
+            let maxPrice = -Infinity;
+            const visibleCandles = candleData.slice(-35); // Show last 35 candles
 
-            const width = chartContainer.clientWidth || window.innerWidth || 375;
-            const height = chartContainer.clientHeight || 260;
-
-            chart = LightweightCharts.createChart(chartContainer, {
-                width: width,
-                height: height,
-                layout: {
-                    background: { color: '#121721' },
-                    textColor: '#7d8590',
-                },
-                grid: {
-                    vertLines: { color: '#181f2c' },
-                    horzLines: { color: '#181f2c' },
-                },
-                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-                timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#232d3f' },
-                rightPriceScale: { borderColor: '#232d3f' }
+            visibleCandles.forEach(c => {
+                if (c.low < minPrice) minPrice = c.low;
+                if (c.high > maxPrice) maxPrice = c.high;
             });
 
-            candleSeries = chart.addCandlestickSeries({
-                upColor: '#0ecb81',
-                downColor: '#f6465d',
-                borderVisible: false,
-                wickUpColor: '#0ecb81',
-                wickDownColor: '#f6465d',
+            const padding = (maxPrice - minPrice) * 0.1 || 2.0;
+            minPrice -= padding;
+            maxPrice += padding;
+            const priceRange = maxPrice - minPrice;
+
+            const chartRightMargin = 55;
+            const chartBottomMargin = 24;
+            const plotWidth = width - chartRightMargin;
+            const plotHeight = height - chartBottomMargin;
+
+            // Horizontal Grid Lines & Price Labels
+            ctx.strokeStyle = '#181f2c';
+            ctx.lineWidth = 1;
+            ctx.fillStyle = '#7d8590';
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'left';
+
+            const gridSteps = 4;
+            for (let i = 0; i <= gridSteps; i++) {
+                const y = plotHeight * (i / gridSteps);
+                const price = maxPrice - (priceRange * (i / gridSteps));
+
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(plotWidth, y);
+                ctx.stroke();
+
+                ctx.fillText('$' + price.toFixed(1), plotWidth + 6, y + 3);
+            }
+
+            // Candlesticks Drawing
+            const numCandles = visibleCandles.length;
+            const candleWidth = Math.max(3, (plotWidth / numCandles) * 0.65);
+            const slotWidth = plotWidth / numCandles;
+
+            visibleCandles.forEach((c, i) => {
+                const x = (i * slotWidth) + (slotWidth / 2);
+                const isGreen = c.close >= c.open;
+                const color = isGreen ? '#0ecb81' : '#f6465d';
+
+                const yHigh = plotHeight - ((c.high - minPrice) / priceRange) * plotHeight;
+                const yLow = plotHeight - ((c.low - minPrice) / priceRange) * plotHeight;
+                const yOpen = plotHeight - ((c.open - minPrice) / priceRange) * plotHeight;
+                const yClose = plotHeight - ((c.close - minPrice) / priceRange) * plotHeight;
+
+                const bodyTop = Math.min(yOpen, yClose);
+                const bodyHeight = Math.max(2, Math.abs(yClose - yOpen));
+
+                // Wick Line
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 1.2;
+                ctx.beginPath();
+                ctx.moveTo(x, yHigh);
+                ctx.lineTo(x, yLow);
+                ctx.stroke();
+
+                // Candle Body
+                ctx.fillStyle = color;
+                ctx.fillRect(x - candleWidth / 2, bodyTop, candleWidth, bodyHeight);
             });
 
-            // Load historical candles
+            // Current Price Highlight Line
+            if (visibleCandles.length > 0) {
+                const lastCandle = visibleCandles[visibleCandles.length - 1];
+                const lastY = plotHeight - ((lastCandle.close - minPrice) / priceRange) * plotHeight;
+                const isGreen = lastCandle.close >= lastCandle.open;
+                const priceColor = isGreen ? '#0ecb81' : '#f6465d';
+
+                ctx.strokeStyle = priceColor;
+                ctx.setLineDash([3, 3]);
+                ctx.beginPath();
+                ctx.moveTo(0, lastY);
+                ctx.lineTo(plotWidth, lastY);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Price Tag on Axis
+                ctx.fillStyle = priceColor;
+                ctx.fillRect(plotWidth + 2, lastY - 9, 50, 18);
+                ctx.fillStyle = '#000';
+                ctx.font = 'bold 10px monospace';
+                ctx.fillText(lastCandle.close.toFixed(1), plotWidth + 6, lastY + 3);
+            }
+        }
+
+        function loadCandles() {
             fetch('/api/v1/candles')
                 .then(r => r.json())
                 .then(data => {
-                    if (data && data.length && candleSeries) {
-                        candleSeries.setData(data);
-                        chart.timeScale().fitContent();
+                    if (data && data.length) {
+                        candleData = data;
+                        drawCanvasChart();
                     }
                 })
                 .catch(err => console.error("Candle fetch error:", err));
-
-            // Auto-resize chart on window change
-            const resizeObserver = new ResizeObserver(entries => {
-                if (entries.length && chart && chartContainer.clientWidth > 0) {
-                    const { width, height } = entries[0].contentRect;
-                    chart.applyOptions({ width: width || 375, height: height || 260 });
-                }
-            });
-            resizeObserver.observe(chartContainer);
         }
 
         function setSide(side) {
@@ -1145,7 +1227,7 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
                     '<div class="ob-bar bid" style="width:' + width + '%;"></div>' +
                     '<span style="color:var(--green); font-weight:700;">▲ ' + b.price.toFixed(2) + '</span>' +
                     '<span style="text-align:center;">' + b.volume.toFixed(2) + '</span>' +
-                    '<span style="text-align:right;">' + (a.price * a.volume).toFixed(0) + '</span>' +
+                    '<span style="text-align:right;">' + (b.price * b.volume).toFixed(0) + '</span>' +
                 '</div>';
             }).join('');
             document.getElementById("bids-container").innerHTML = bidsHtml || '<div style="padding:10px; color:var(--text-dim); text-align:center;">No bids</div>';
@@ -1178,15 +1260,25 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
             if (tape.children.length > 30) tape.removeChild(tape.lastChild);
 
             // Update live candle tick
-            if (candleSeries) {
+            if (candleData && candleData.length > 0) {
                 const nowSec = Math.floor(Date.now() / 1000);
-                candleSeries.update({
-                    time: nowSec - (nowSec % 60),
-                    open: trd.price,
-                    high: trd.price + 0.5,
-                    low: trd.price - 0.5,
-                    close: trd.price
-                });
+                const currentMinute = nowSec - (nowSec % 60);
+                const last = candleData[candleData.length - 1];
+
+                if (last && last.time === currentMinute) {
+                    last.high = Math.max(last.high, trd.price);
+                    last.low = Math.min(last.low, trd.price);
+                    last.close = trd.price;
+                } else {
+                    candleData.push({
+                        time: currentMinute,
+                        open: trd.price,
+                        high: trd.price,
+                        low: trd.price,
+                        close: trd.price
+                    });
+                }
+                drawCanvasChart();
             }
         }
 
@@ -1290,14 +1382,7 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
                 pOrders.style.display = 'flex';
             } else if (tab === 'chart') {
                 pChart.style.display = 'block';
-                if (!chart) {
-                    initChart();
-                } else {
-                    const w = pChart.clientWidth || window.innerWidth || 375;
-                    const h = 260;
-                    chart.applyOptions({ width: w, height: h });
-                    chart.timeScale().fitContent();
-                }
+                setTimeout(drawCanvasChart, 50);
             } else if (tab === 'orderbook') {
                 pBook.style.display = 'flex';
             } else if (tab === 'orders') {
@@ -1384,7 +1469,8 @@ func (s *Server) handleTerminalUI(w http.ResponseWriter, r *http.Request) {
 
         // Initialize App
         window.addEventListener('DOMContentLoaded', () => {
-            initChart();
+            loadCandles();
+            window.addEventListener('resize', drawCanvasChart);
             fetch("/api/v1/orderbook").then(r => r.json()).then(renderOrderBook);
             fetch("/api/v1/account").then(r => r.json()).then(renderAccount);
             fetch("/api/v1/trades").then(r => r.json()).then(trades => trades.forEach(renderTrade));
